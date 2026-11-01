@@ -345,27 +345,21 @@ class Orchestrator:
         return out
 
     @staticmethod
-    def exercise_frontier_scenarios(market: Market, option: Option, pricer: PriceParameters,
-                                    scenarios: dict, div_date=None) -> tuple[dict, float | None]:
-        """Frontière d'exercice (date, S*) de l'option américaine pour chaque scénario {nom: (taux, dividende)}.
-
-        Spot, volatilité, strike et maturité restent ceux de l'utilisateur. La date de détachement est celle
-        fournie par `div_date` (ou, à défaut, `market.ex_div_date`) ; elle ne sert que si le scénario spécifie
-        un dividende strictement positif. Renvoie aussi la date du détachement (en années) pour la tracer.
-        """
+    def exercise_frontier_scenarios(market, option, pricer, scenarios):
         opt = Option(option.K, option.maturity, option.call_put, "americaine")
-        params = PriceParameters(**{**vars(pricer), "engine": "vector"})
-        target_date = div_date if div_date is not None else market.ex_div_date
+        params = PriceParameters(**{**vars(pricer), "engine": "vector"})   # ← ** et non *
         frontiers, div_time = {}, None
         for name, (r, d) in scenarios.items():
-            mk = Market(market.s0, r, market.vol, d, target_date if d > 0 else None)
-            tree = Orchestrator.vector_tree(mk, opt, params)
+            tree = Orchestrator.vector_tree(
+                Market(market.s0, r, market.vol, d, market.ex_div_date), opt, params)
             try:
                 if d > 0 and tree.div_step > 0:
                     div_time = tree.div_step * tree.dt_
-                frontiers[name] = [(i * tree.dt_, float(lv["S"][lv["ex"]].max() if opt.call_put == "put"
-                                                        else lv["S"][lv["ex"]].min()))
-                                   for i, lv in enumerate(tree.levels[:-1]) if lv["ex"].any()]
+                frontiers[name] = [
+                    (i * tree.dt_,
+                     float(lv["S"][lv["ex"]].max() if opt.call_put == "put"
+                           else lv["S"][lv["ex"]].min()))
+                    for i, lv in enumerate(tree.levels[:-1]) if lv["ex"].any()]
             finally:
                 tree.release()
         return frontiers, div_time
