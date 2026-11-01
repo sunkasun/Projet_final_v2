@@ -210,7 +210,7 @@ class Orchestrator:
         """Contrôles de cohérence du prix : Black-Scholes, parité call-put, forward, martingale, bornes d'arbitrage,
         américaine / européenne, égalité des moteurs.
 
-        Chaque ligne : Contrôle, Valeur, Tolérance, Verdict (« Validé », « Échec », « Attention » ou « N/A »), Détail.
+        Chaque ligne : Contrôle, Valeur, Tolérance, Verdict (« Validé », « Échec », « Attention » ou « N/A »).
         Les prix complémentaires (call / put, européenne / américaine) sont calculés sur la même grille de pas.
         """
         n, levels, r, T = tree.n_steps, tree.levels, market.rate, tree.dt_ * tree.n_steps
@@ -238,29 +238,24 @@ class Orchestrator:
             ok = abs(price - bs) <= tol
             checks.append({"Contrôle": "Européenne sans dividende ≈ Black-Scholes",
                            "Valeur": f"arbre {price:.6f} · BS {bs:.6f} · écart {price - bs:+.2e}", "Tolérance": f"{tol:.2e}",
-                           "Verdict": "N/A" if n < 30 else ("Validé" if ok else "Échec"),
-                           "Détail": "N < 30 : borne asymptotique non applicable" if n < 30
-                           else "borne C/(6N) de l'erreur de discrétisation, marge 25 %"})
+                           "Verdict": "N/A" if n < 30 else ("Validé" if ok else "Échec")})
         else:
             checks.append({"Contrôle": "Européenne sans dividende ≈ Black-Scholes", "Valeur": "—", "Tolérance": "—",
-                           "Verdict": "N/A", "Détail": "seulement pour une européenne sans dividende"})
+                           "Verdict": "N/A"})
 
         # 2. Parité call-put européenne (avec la date de dividende de la grille)
         lhs, rhs = prices[("call", "europeen")] - prices[("put", "europeen")], s_adj - option.K * disc_T
         checks.append({"Contrôle": "Parité call-put : C − P = S0 − D·e^(−r·t_D) − K·e^(−rT)",
                        "Valeur": f"C − P = {lhs:.8f} · membre de droite = {rhs:.8f} · écart {lhs - rhs:+.2e}",
                        "Tolérance": f"{tol_inv:.2e}", "Verdict": "Validé" if abs(lhs - rhs) <= tol_inv else
-                       ("Attention" if abs(lhs - rhs) <= 1e-3 * max(market.s0, option.K) else "Échec"),
-                       "Détail": ("date de détachement arrondie au pas de la grille ; " if t_div is not None else "")
-                       + "orange : écart faible dû aux nœuds aux moments corrigés (gros dividende) ou à l'élagage"})
+                       ("Attention" if abs(lhs - rhs) <= 1e-3 * max(market.s0, option.K) else "Échec")})
 
         # 3. Espérance terminale de l'arbre = forward
         mean_T, fwd = float((levels[-1]["P"] * levels[-1]["S"]).sum()), tree._steps[-1]["F"]
         checks.append({"Contrôle": "Espérance du sous-jacent à maturité = forward",
                        "Valeur": f"arbre {mean_T:.8f} · forward {fwd:.8f} · écart {mean_T - fwd:+.2e}",
                        "Tolérance": f"{tol_inv:.2e}", "Verdict": "Validé" if abs(mean_T - fwd) <= tol_inv else
-                       ("Attention" if abs(mean_T - fwd) <= 1e-3 * max(market.s0, option.K) else "Échec"),
-                       "Détail": "un écart vient des nœuds aux moments corrigés (voir le rapport de débogage)"})
+                       ("Attention" if abs(mean_T - fwd) <= 1e-3 * max(market.s0, option.K) else "Échec")})
 
         # 4. Valeur moyenne actualisée par date : martingale (européenne) ou surmartingale (américaine)
         avg = [float((lv["P"] * lv["V"]).sum()) * math.exp(-r * i * tree.dt_) for i, lv in enumerate(levels)]
@@ -269,14 +264,12 @@ class Orchestrator:
             gap = max(avg[i + 1] - avg[i] for i in range(n)) if n else 0.0
             checks.append({"Contrôle": "Valeur moyenne actualisée décroissante par date (surmartingale)",
                            "Valeur": f"à t0 {avg[0]:.6f} · à maturité {avg[-1]:.6f} · hausse max {gap:+.2e}",
-                           "Tolérance": f"{tol_mart:.2e}", "Verdict": "Validé" if gap <= tol_mart else "Échec",
-                           "Détail": "V ≥ valeur de continuation à chaque nœud"})
+                           "Tolérance": f"{tol_mart:.2e}", "Verdict": "Validé" if gap <= tol_mart else "Échec"})
         else:
             gap = max(abs(a - avg[0]) for a in avg)
             checks.append({"Contrôle": "Valeur moyenne actualisée constante par date (martingale)",
                            "Valeur": f"à t0 {avg[0]:.6f} · à maturité {avg[-1]:.6f} · écart max {gap:.2e}",
-                           "Tolérance": f"{tol_mart:.2e}", "Verdict": "Validé" if gap <= tol_mart else "Échec",
-                           "Détail": "prix actualisé martingale sous la probabilité risque-neutre"})
+                           "Tolérance": f"{tol_mart:.2e}", "Verdict": "Validé" if gap <= tol_mart else "Échec"})
 
         # 5. Bornes d'arbitrage
         if option.call_put == "call":
@@ -287,14 +280,12 @@ class Orchestrator:
             low = max(low, option.payoff(market.s0))
         checks.append({"Contrôle": "Bornes d'arbitrage", "Valeur": f"{low:.6f} ≤ {price:.6f} ≤ {high:.6f}",
                        "Tolérance": f"{tol_inv:.2e}",
-                       "Verdict": "Validé" if low - tol_inv <= price <= high + tol_inv else "Échec",
-                       "Détail": "borne basse : valeur intrinsèque actualisée (et immédiate si américaine)"})
+                       "Verdict": "Validé" if low - tol_inv <= price <= high + tol_inv else "Échec"})
 
         # 6. Américaine ≥ européenne
         checks.append({"Contrôle": f"{option.call_put.capitalize()} américain ≥ européen",
                        "Valeur": f"Am {amer:.6f} · Eu {euro:.6f} · prime {amer - euro:+.2e}", "Tolérance": f"{tol_mart:.2e}",
-                       "Verdict": "Validé" if amer - euro >= -tol_mart else "Échec",
-                       "Détail": "le droit d'exercer plus tôt ne peut pas avoir une valeur négative"})
+                       "Verdict": "Validé" if amer - euro >= -tol_mart else "Échec"})
 
         # 7. Américaine = européenne quand l'exercice anticipé est sous-optimal (sans dividende)
         if not tree.div_step and ((option.call_put == "call" and r >= 0.0) or (option.call_put == "put" and r <= 0.0)):
@@ -303,14 +294,10 @@ class Orchestrator:
                            "Valeur": f"Am {amer:.6f} · Eu {euro:.6f} · écart {amer - euro:+.2e}",
                            "Tolérance": f"{tol_mart:.2e}",
                            "Verdict": "Validé" if abs(amer - euro) <= tol_mart else ("Attention" if pricer.pruning and
-                                      abs(amer - euro) <= 1e-4 * max(abs(euro), 1.0) else "Échec"),
-                           "Détail": "borne d'arbitrage : la continuation vaut toujours plus que l'exercice"
-                           if abs(amer - euro) <= tol_mart else "écart dû à l'élagage : un nœud élagué n'a qu'un enfant "
-                           "(vers le centre en binomial), la martingale n'y est plus exacte"})
+                                      abs(amer - euro) <= 1e-4 * max(abs(euro), 1.0) else "Échec")})
         else:
             checks.append({"Contrôle": "Américaine = européenne (exercice anticipé sous-optimal)", "Valeur": "—",
-                           "Tolérance": "—", "Verdict": "N/A",
-                           "Détail": "seulement sans dividende : call si r ≥ 0, put si r ≤ 0"})
+                           "Tolérance": "—", "Verdict": "N/A"})
 
         # 8. Moteurs vectorisé et objets identiques (sur au plus 200 pas)
         n_test = min(n, 200)
@@ -320,12 +307,11 @@ class Orchestrator:
         tol = 1e-9 * max(abs(v_vec), 1.0)
         checks.append({"Contrôle": "Moteurs vectorisé et objets identiques",
                        "Valeur": f"N = {n_test} : vectorisé {v_vec:.10f} · objets {v_obj:.10f} · écart {v_vec - v_obj:+.1e}",
-                       "Tolérance": f"{tol:.1e}", "Verdict": "Validé" if abs(v_vec - v_obj) <= tol else "Échec",
-                       "Détail": "deux implémentations indépendantes de la construction et du backward"})
+                       "Tolérance": f"{tol:.1e}", "Verdict": "Validé" if abs(v_vec - v_obj) <= tol else "Échec"})
         return checks
 
     # ------------------------------------------------------------------------------------------------------------
-    # Analyses ajoutées pour le rapport : exercice anticipé, loi de l'arbre, dividende, position du strike
+    # Analyses ajoutées pour le rapport : exercice anticipé
     # ------------------------------------------------------------------------------------------------------------
     @staticmethod
     def exercise_profile(market: Market, option: Option, pricer: PriceParameters) -> dict:
@@ -369,53 +355,6 @@ class Orchestrator:
                                                  else lv["S"][lv["ex"]].min()))
                             for i, lv in enumerate(tree.levels[:-1]) if lv["ex"].any()]
         return frontiers
-
-    @staticmethod
-    def law_distance(market: Market, option: Option, pricer: PriceParameters) -> float:
-        """Distance de Kolmogorov-Smirnov entre la loi terminale de l'arbre et la log-normale de Black-Scholes
-        (valable sans dividende) : max |F_arbre − F_BS|, évalué de part et d'autre de chaque marche."""
-        tree = Orchestrator.vector_tree(market, option, PriceParameters(**{**vars(pricer), "engine": "vector"}))
-        T, last = tree.dt_ * tree.n_steps, tree.levels[-1]
-        order = np.argsort(last["S"])
-        S, cdf = last["S"][order], np.cumsum(last["P"][order])
-        ref = norm.cdf((np.log(S / market.s0) - (market.rate - 0.5 * market.vol ** 2) * T) / (market.vol * math.sqrt(T)))
-        return float(max(np.max(np.abs(cdf - ref)), np.max(np.abs(np.r_[0.0, cdf[:-1]] - ref))))
-
-    @staticmethod
-    def dividend_moments(market: Market, option: Option, pricer: PriceParameters, dividends: list[float]) -> list[dict]:
-        """Au pas du dividende, pour chaque montant D et chaque arbre : nœuds dont les moments ne sont plus exacts
-        (probabilité négative ramenée à 0), leur masse et l'erreur relative de variance pondérée par la masse."""
-        ex_date = market.ex_div_date
-        if ex_date is None or not pricer.pricing_date < ex_date <= option.maturity:
-            ex_date = pricer.pricing_date + (option.maturity - pricer.pricing_date) / 2
-        rows = []
-        for method in (TreeMethod.TRINOMIAL, TreeMethod.BINOMIAL):
-            for D in dividends:
-                m = Market(market.s0, market.rate, market.vol, D, ex_date)
-                tree = Orchestrator.vector_tree(m, option, PriceParameters(
-                    **{**vars(pricer), "tree_method": method, "engine": "vector", "pruning": False}))
-                i = tree.div_step
-                tr, parents, children = tree.transitions(i), tree.levels[i - 1], tree.levels[i]
-                iu, im, idn = LevelVectorized.child_index(children["pos"], tr["k"], tr["has"])
-                pu, pm, pd_ = tr["p"]
-                S_c = children["S"]
-                m1 = S_c[iu] * pu + S_c[im] * pm + S_c[idn] * pd_
-                m2 = S_c[iu] ** 2 * pu + S_c[im] ** 2 * pm + S_c[idn] ** 2 * pd_
-                target = parents["S"] ** 2 * math.exp(2.0 * m.rate * tree.dt_) * math.expm1(m.vol ** 2 * tree.dt_)
-                rel = np.abs(m2 - m1 ** 2 - target) / np.maximum(target, 1e-300)
-                wrong = (np.abs(m1 - tr["E"]) > 1e-9 * tr["E"]) | (rel > 1e-6)
-                rows.append({"Arbre": method.label, "Dividende D": D, "D / S0": f"{D / m.s0:.0%}",
-                             "Nœuds aux moments corrigés": f"{int(wrong.sum())} sur {len(parents['S'])}",
-                             "Masse de ces nœuds": float(parents["P"][wrong].sum()),
-                             "Erreur relative de variance": float((parents["P"] * rel).sum())})
-        return rows
-
-    @staticmethod
-    def strike_position(tree: TreeVectorized, K: float) -> float:
-        """Position θ ∈ [0, 1[ du strike entre les deux nœuds terminaux qui l'encadrent, mesurée en log."""
-        S = np.sort(tree.levels[-1]["S"])
-        j = int(np.clip(np.searchsorted(S, K, side="right") - 1, 0, len(S) - 2))
-        return float(math.log(K / S[j]) / math.log(S[j + 1] / S[j]))
 
     @staticmethod
     def benchmark(market: Market, option: Option, pricer: PriceParameters, method: str = "backward",
