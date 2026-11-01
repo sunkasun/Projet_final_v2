@@ -371,12 +371,6 @@ class EtudeComparative:
             return
         with Affichage.safe("Convergence du prix"):
             cls.convergence_prix(market, option, pricer, key)
-        with Affichage.safe("Convergence selon le strike"):
-            cls.convergence_selon_strike(market, option, pricer, key)
-        with Affichage.safe("Étude de l'erreur"):
-            cls.loi_erreur(market, option, pricer, key)
-        with Affichage.safe("Convergence en loi"):
-            cls.convergence_en_loi(market, option, pricer, key)
         with Affichage.safe("Convergence des grecques"):
             cls.convergence_grecques(market, option, pricer, key)
         with Affichage.safe("Prix et pente selon le strike"):
@@ -385,8 +379,6 @@ class EtudeComparative:
             cls.types_options(market, option, pricer, key)
         with Affichage.safe("Frontière d'exercice selon le taux"):
             cls.frontiere_selon_taux(market, option, pricer, key)
-        with Affichage.safe("Dividende : limites de la construction"):
-            cls.moments_dividende(market, option, pricer, key)
         with Affichage.safe("Grecques selon un paramètre"):
             cls.grecques_selon_parametre(market, option, pricer, key)
         gc.collect()
@@ -426,185 +418,6 @@ class EtudeComparative:
             fig.add_hline(y=0, line_dash="dot", line_color="black")
             fig.update_xaxes(type="log")
             Affichage.show_chart(fig, f"cmp_conv_{key}")
-
-    @classmethod
-    def convergence_selon_strike(cls, market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
-        """Erreur absolue et relative selon N pour quatre strikes (0,9 K ; K ; 1,05 K ; 1,5 K), arbre au choix."""
-        n_max = max(300, pricer.nb_steps)
-        with Affichage.section(f"Convergence selon le strike – 5 à {n_max:,} pas",
-                               "Référence : Black-Scholes, sinon trinomial à 2 x N maximal. Près de la monnaie, "
-                               "l'erreur absolue est la plus forte ; loin de la monnaie, c'est l'erreur relative."):
-            c1, c2 = st.columns(2)
-            method = c1.radio("Arbre", cls.METHODS, format_func=lambda m: m.label, horizontal=True,
-                              index=1, key=f"cmp_kconv_m_{key}")
-            view = c2.radio("Erreur", ("Absolue", "Relative"), horizontal=True, key=f"cmp_kconv_v_{key}")
-            saved = st.session_state.get("res_kconv")
-            if saved is None or saved[0] != (key, method):
-                with st.spinner("Convergence selon le strike…"):
-                    grid = sorted(set(range(5, 101)) | {int(round(x)) for x in np.geomspace(100, n_max, 30)})
-                    frames = {}
-                    for factor in (0.9, 1.0, 1.05, 1.5):
-                        opt = Option(round(option.K * factor, 2), option.maturity, option.call_put,
-                                     option.eur_am.value)
-                        ref = Orchestrator.black_scholes(market, opt, pricer)
-                        if ref is None:
-                            ref = Orchestrator.price(market, opt, PriceParameters(
-                                **{**vars(pricer), "nb_steps": min(10_000, 2 * n_max),
-                                   "tree_method": TreeMethod.TRINOMIAL, "engine": "vector"}))
-                        err = [Orchestrator.price(market, opt, PriceParameters(
-                            **{**vars(pricer), "nb_steps": n, "tree_method": method, "engine": "vector"})) - ref
-                               for n in grid]
-                        frames[opt.K] = (pd.DataFrame({"N": grid, "Erreur": err}), ref)
-                st.session_state["res_kconv"] = ((key, method), frames)
-            frames = st.session_state["res_kconv"][1]
-            y_title = "|arbre − référence|" if view == "Absolue" else "|arbre − référence| / référence"
-            fig = Affichage.new_fig(f"Erreur selon N pour plusieurs strikes – {method.label}", "Nombre de pas N", y_title)
-            for i, (K, (df, ref)) in enumerate(frames.items()):
-                y = np.abs(df["Erreur"]) / (abs(ref) if view == "Relative" else 1.0)
-                fig.add_trace(go.Scatter(x=df["N"], y=np.maximum(y, 1e-12), mode="lines", name=f"K = {K:,.2f}",
-                                         line=dict(color=Affichage.COLORS[i], width=1.4)))
-            fig.update_yaxes(type="log")
-            Affichage.show_chart(fig, f"cmp_kconv_{key}")
-
-    @classmethod
-    def loi_erreur(cls, market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
-        """N x erreur selon N, puis selon la position θ du strike entre deux nœuds terminaux (européenne sans dividende)."""
-        n_max = max(300, pricer.nb_steps)
-        with Affichage.section(f"Étude de l'erreur : position du strike sur la grille – 30 à {n_max:,} pas",
-                               "Tracée selon N, l'erreur semble irrégulière ; selon θ (0 : strike sur un nœud, "
-                               "0,5 : à mi-chemin), elle suit une parabole. Courbe théorique trinomiale : "
-                               "C·[1/12 − (θ − ½)²], C = 1,5·e^(−rT)·K·σ·√T·φ(d2)."):
-            ref = Orchestrator.black_scholes(market, option, pricer)
-            if ref is None:
-                st.info("Étude réservée à une option européenne sans dividende (référence Black-Scholes).")
-                return
-            saved = st.session_state.get("res_theta")
-            if saved is None or saved[0] != key:
-                rows = []
-                with st.spinner("Position du strike…"):
-                    for n in range(30, n_max + 1, max(1, n_max // 300)):
-                        for m in cls.METHODS:
-                            tree = Orchestrator.vector_tree(market, option, PriceParameters(
-                                **{**vars(pricer), "nb_steps": n, "tree_method": m, "engine": "vector",
-                                   "pruning": False}))
-                            rows.append({"N": n, "Méthode": m.label, "θ": Orchestrator.strike_position(tree, option.K),
-                                         "N x erreur": n * (float(tree.levels[0]["V"][0]) - ref)})
-                st.session_state["res_theta"] = (key, pd.DataFrame(rows))
-            df = st.session_state["res_theta"][1]
-            T = PriceParameters.year_fraction(pricer.pricing_date, option.maturity)
-            d2 = (math.log(market.s0 / option.K) + (market.rate - 0.5 * market.vol ** 2) * T) / (market.vol * math.sqrt(T))
-            C = 1.5 * math.exp(-market.rate * T) * option.K * market.vol * math.sqrt(T) * norm.pdf(d2)
-            c1, c2 = st.columns(2)
-            for col, x, x_title in ((c1, "N", "Nombre de pas N"), (c2, "θ", "θ : position du strike entre deux nœuds")):
-                with col:
-                    fig = Affichage.new_fig(f"N x erreur selon {x}", x_title, "N x (arbre − Black-Scholes)")
-                    for m in cls.METHODS:
-                        color, _ = Affichage.METHOD_STYLE[m]
-                        sub = df[df["Méthode"] == m.label]
-                        fig.add_trace(go.Scatter(x=sub[x], y=sub["N x erreur"], name=m.label,
-                                                 mode="markers" if x == "θ" else "lines",
-                                                 marker=dict(size=4, color=color), line=dict(color=color, width=1.2)))
-                    if x == "θ":
-                        g = np.linspace(0, 1, 101)
-                        fig.add_trace(go.Scatter(x=g, y=C * (1 / 12 - (g - 0.5) ** 2), mode="lines",
-                                                 name="Théorie trinomial", line=dict(color="black", dash="dash")))
-                    fig.add_hline(y=0, line_dash="dot", line_color="grey")
-                    Affichage.show_chart(fig, f"cmp_theta_{x}_{key}")
-
-    @classmethod
-    def convergence_en_loi(cls, market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
-        """Distance de Kolmogorov-Smirnov entre la loi terminale de l'arbre et la log-normale selon N, et fonction
-        de répartition en escalier à 20 pas."""
-        with Affichage.section("Convergence en loi : distance de Kolmogorov-Smirnov à la log-normale",
-                               "KS ≈ moitié de la plus grosse masse d'un nœud : 0,3455/√N en trinomial, "
-                               "0,3989/√N en binomial (pointillés). Référence log-normale : sans dividende."):
-            if market.dividend > 0 and market.ex_div_date is not None and \
-                    pricer.pricing_date < market.ex_div_date <= option.maturity:
-                st.info("Avec un dividende, la loi terminale n'est plus log-normale : étude réservée au cas sans dividende.")
-                return
-            saved = st.session_state.get("res_law")
-            if saved is None or saved[0] != key:
-                with st.spinner("Distances entre lois…"):
-                    grid = [10, 20, 50, 100, 200, 400, 800]
-                    df = pd.DataFrame([{"N": n, **{m.label: Orchestrator.law_distance(market, option, PriceParameters(
-                        **{**vars(pricer), "nb_steps": n, "tree_method": m, "pruning": False})) for m in cls.METHODS}}
-                        for n in grid])
-                    tree = Orchestrator.vector_tree(market, option, PriceParameters(
-                        **{**vars(pricer), "nb_steps": 20, "tree_method": TreeMethod.TRINOMIAL, "engine": "vector",
-                           "pruning": False}))
-                st.session_state["res_law"] = (key, df, tree.levels[-1]["S"], tree.levels[-1]["P"])
-            _, df, S, P = st.session_state["res_law"]
-            c1, c2 = st.columns(2)
-            with c1:
-                fig = Affichage.new_fig("Distance KS selon N", "Nombre de pas N", "KS")
-                for m, const in zip(cls.METHODS, (1 / math.sqrt(2 * math.pi), math.sqrt(3) / (2 * math.sqrt(2 * math.pi)))):
-                    color, _ = Affichage.METHOD_STYLE[m]
-                    fig.add_trace(go.Scatter(x=df["N"], y=df[m.label], mode="lines+markers", name=f"{m.label} (mesuré)",
-                                             line=dict(color=color, width=2)))
-                    fig.add_trace(go.Scatter(x=df["N"], y=const / np.sqrt(df["N"]), mode="lines",
-                                             name=f"{m.label} : {const:.4f}/√N", line=dict(color=color, dash="dot")))
-                fig.update_xaxes(type="log")
-                fig.update_yaxes(type="log")
-                Affichage.show_chart(fig, f"cmp_law_ks_{key}")
-            with c2:
-                T = PriceParameters.year_fraction(pricer.pricing_date, option.maturity)
-                order = np.argsort(S)
-                x = np.linspace(S.min(), S.max(), 400)
-                fig = Affichage.new_fig("Fonction de répartition à 20 pas : un escalier", "S_T", "P(S_T ≤ x)")
-                fig.add_trace(go.Scatter(x=S[order], y=np.cumsum(P[order]), mode="lines", line_shape="hv",
-                                         name="Arbre trinomial", line=dict(color=Affichage.COLORS[1])))
-                fig.add_trace(go.Scatter(x=x, y=norm.cdf((np.log(x / market.s0) - (market.rate - 0.5 * market.vol ** 2) * T)
-                                                         / (market.vol * math.sqrt(T))), mode="lines",
-                                         name="Log-normale", line=dict(color="black")))
-                Affichage.show_chart(fig, f"cmp_law_cdf_{key}")
-
-    @staticmethod
-    def frontiere_selon_taux(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
-        """Frontière d'exercice (prix critique S* par date) d'un put ou d'un call américain pour cinq taux."""
-        n_used = min(pricer.nb_steps, 500)
-        rates = [-0.02, 0.0, 0.01, 0.03, 0.05]
-        with Affichage.section(f"Frontière d'exercice selon le taux – {n_used:,} pas",
-                               "Put : exercer si S ≤ S* ; call : exercer si S ≥ S*. Dividende du marché conservé. "
-                               "Aucune courbe : pas d'exercice anticipé (à r = 0, les nœuds affichés relèvent de "
-                               "l'indifférence, voir l'onglet pricer)."):
-            kind = st.radio("Option américaine", ("put", "call"), horizontal=True, key=f"cmp_front_kind_{key}")
-            saved = st.session_state.get("res_front")
-            if saved is None or saved[0] != (key, kind):
-                with st.spinner("Frontières d'exercice…"):
-                    frontiers = Orchestrator.exercise_frontiers(market, Option(option.K, option.maturity, kind, "americaine"),
-                                                                PriceParameters(**{**vars(pricer), "nb_steps": n_used}),
-                                                                rates)
-                st.session_state["res_front"] = ((key, kind), frontiers)
-            frontiers = st.session_state["res_front"][1]
-            fig = Affichage.new_fig(f"Frontière d'exercice du {kind} américain", "Temps t (années)", "Prix critique S*")
-            for i, (r, points) in enumerate(frontiers.items()):
-                if points:
-                    fig.add_trace(go.Scatter(x=[p[0] for p in points], y=[p[1] for p in points],
-                                             mode="lines+markers" if len(points) < 5 else "lines",
-                                             name=f"r = {r:.0%}", line=dict(color=Affichage.COLORS[i], width=2)))
-            fig.add_hline(y=option.K, line_dash="dot", line_color="black", annotation_text="K")
-            Affichage.show_chart(fig, f"cmp_front_{key}")
-            st.caption("Taux sans exercice anticipé : " + (", ".join(f"{r:.0%}" for r, p in frontiers.items() if not p)
-                                                         or "aucun"))
-
-    @staticmethod
-    def moments_dividende(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
-        """Nœuds aux moments corrigés au pas du dividende pour D = 5 %, 20 % et 50 % du spot, binomial et trinomial."""
-        n_used = min(pricer.nb_steps, 200)
-        with Affichage.section(f"Dividende : limites de la construction – {n_used:,} pas",
-                               "Au-delà de D/S ≈ 42 % (trinomial) ou 50 % (binomial), trois enfants ne peuvent plus "
-                               "porter la variance : une probabilité négative est ramenée à 0 et les moments ne sont "
-                               "plus exacts sur ces nœuds."):
-            saved = st.session_state.get("res_divmom")
-            if saved is None or saved[0] != key:
-                with st.spinner("Moments au pas du dividende…"):
-                    rows = Orchestrator.dividend_moments(market, option, PriceParameters(
-                        **{**vars(pricer), "nb_steps": n_used}), [round(market.s0 * f, 2) for f in (0.05, 0.2, 0.5)])
-                st.session_state["res_divmom"] = (key, rows)
-            df = pd.DataFrame(st.session_state["res_divmom"][1])
-            df["Masse de ces nœuds"] = df["Masse de ces nœuds"].map(lambda v: f"{v:.2e}")
-            df["Erreur relative de variance"] = df["Erreur relative de variance"].map(lambda v: f"{v:.2e}")
-            Affichage.show_df(df)
 
     @classmethod
     def convergence_grecques(cls, market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
@@ -752,6 +565,35 @@ class EtudeComparative:
             fig.update_layout(yaxis2=dict(title="Écart américain − européen", overlaying="y", side="right",
                                           showgrid=False, tickformat="~g"))
             Affichage.show_chart(fig, f"cmp_types_plot_{key}")
+
+    @staticmethod
+    def frontiere_selon_taux(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
+        """Frontière d'exercice (prix critique S* par date) d'un put ou d'un call américain pour cinq taux."""
+        n_used = min(pricer.nb_steps, 500)
+        rates = [-0.02, 0.0, 0.01, 0.03, 0.05]
+        with Affichage.section(f"Frontière d'exercice selon le taux – {n_used:,} pas",
+                               "Put : exercer si S ≤ S* ; call : exercer si S ≥ S*. Dividende du marché conservé. "
+                               "Aucune courbe : pas d'exercice anticipé (à r = 0, les nœuds affichés relèvent de "
+                               "l'indifférence, voir l'onglet pricer)."):
+            kind = st.radio("Option américaine", ("put", "call"), horizontal=True, key=f"cmp_front_kind_{key}")
+            saved = st.session_state.get("res_front")
+            if saved is None or saved[0] != (key, kind):
+                with st.spinner("Frontières d'exercice…"):
+                    frontiers = Orchestrator.exercise_frontiers(market, Option(option.K, option.maturity, kind, "americaine"),
+                                                                PriceParameters(**{**vars(pricer), "nb_steps": n_used}),
+                                                                rates)
+                st.session_state["res_front"] = ((key, kind), frontiers)
+            frontiers = st.session_state["res_front"][1]
+            fig = Affichage.new_fig(f"Frontière d'exercice du {kind} américain", "Temps t (années)", "Prix critique S*")
+            for i, (r, points) in enumerate(frontiers.items()):
+                if points:
+                    fig.add_trace(go.Scatter(x=[p[0] for p in points], y=[p[1] for p in points],
+                                             mode="lines+markers" if len(points) < 5 else "lines",
+                                             name=f"r = {r:.0%}", line=dict(color=Affichage.COLORS[i], width=2)))
+            fig.add_hline(y=option.K, line_dash="dot", line_color="black", annotation_text="K")
+            Affichage.show_chart(fig, f"cmp_front_{key}")
+            st.caption("Taux sans exercice anticipé : " + (", ".join(f"{r:.0%}" for r, p in frontiers.items() if not p)
+                                                         or "aucun"))
 
     @staticmethod
     def grecques_selon_parametre(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
