@@ -377,8 +377,8 @@ class EtudeComparative:
             cls.prix_selon_strike(market, option, pricer, key)
         with Affichage.safe("Types d'options"):
             cls.types_options(market, option, pricer, key)
-        with Affichage.safe("Frontière d'exercice selon le taux"):
-            cls.frontiere_selon_taux(market, option, pricer, key)
+        with Affichage.safe("Frontières d'exercice"):
+            cls.frontieres_exercice(market, option, pricer, key)
         with Affichage.safe("Grecques selon un paramètre"):
             cls.grecques_selon_parametre(market, option, pricer, key)
         gc.collect()
@@ -567,33 +567,53 @@ class EtudeComparative:
             Affichage.show_chart(fig, f"cmp_types_plot_{key}")
 
     @staticmethod
-    def frontiere_selon_taux(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
-        """Frontière d'exercice (prix critique S* par date) d'un put ou d'un call américain pour cinq taux."""
+    def frontieres_exercice(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
+        """Frontières d'exercice du put et du call américains pour des scénarios de taux et de dividende fixés."""
         n_used = min(pricer.nb_steps, 500)
-        rates = [-0.02, 0.0, 0.01, 0.03, 0.05]
-        with Affichage.section(f"Frontière d'exercice selon le taux – {n_used:,} pas",
-                               "Put : exercer si S ≤ S* ; call : exercer si S ≥ S*. Dividende du marché conservé. "
-                               "Aucune courbe : pas d'exercice anticipé (à r = 0, les nœuds affichés relèvent de "
-                               "l'indifférence, voir l'onglet pricer)."):
-            kind = st.radio("Option américaine", ("put", "call"), horizontal=True, key=f"cmp_front_kind_{key}")
-            saved = st.session_state.get("res_front")
-            if saved is None or saved[0] != (key, kind):
+        # date affichée dans les libellés : on retombe sur pricing_date + 6 mois si aucune date n'est fournie
+        div_date_label = market.ex_div_date or (pricer.pricing_date + dt.timedelta(days=182))
+        div = f"D = 3 au {div_date_label:%d/%m/%Y}"
+        # nom : (taux, dividende, couleur, tirets)
+        cases = {"put": {"Put, r = 1 %, sans dividende": (0.01, 0.0, "#9ecae1", "solid"),
+                         "Put, r = 3 %, sans dividende": (0.03, 0.0, "#4292c6", "solid"),
+                         "Put, r = 5 %, sans dividende": (0.05, 0.0, "#08519c", "solid"),
+                         f"Put, r = 3 %, {div}": (0.03, 3.0, "#d62728", "dash")},
+                 "call": {"Call, r = −2 %, sans dividende": (-0.02, 0.0, "#2ca02c", "solid"),
+                          f"Call, r = −2 %, {div}": (-0.02, 3.0, "#98df8a", "solid"),
+                          f"Call, r = 3 %, {div}": (0.03, 3.0, "#ff7f0e", "solid")}}
+        with Affichage.section(f"Frontières d'exercice – {n_used:,} pas",
+                               "Put : exercer si S ≤ S* ; call : exercer si S ≥ S*. Taux et dividendes fixés, "
+                               "autres paramètres de marché saisis dans la barre latérale."):
+            saved = st.session_state.get("res_frontieres")
+            if saved is None or saved[0] != key:
                 with st.spinner("Frontières d'exercice…"):
-                    frontiers = Orchestrator.exercise_frontiers(market, Option(option.K, option.maturity, kind, "americaine"),
-                                                                PriceParameters(**{**vars(pricer), "nb_steps": n_used}),
-                                                                rates)
-                st.session_state["res_front"] = ((key, kind), frontiers)
-            frontiers = st.session_state["res_front"][1]
-            fig = Affichage.new_fig(f"Frontière d'exercice du {kind} américain", "Temps t (années)", "Prix critique S*")
-            for i, (r, points) in enumerate(frontiers.items()):
-                if points:
-                    fig.add_trace(go.Scatter(x=[p[0] for p in points], y=[p[1] for p in points],
-                                             mode="lines+markers" if len(points) < 5 else "lines",
-                                             name=f"r = {r:.0%}", line=dict(color=Affichage.COLORS[i], width=2)))
-            fig.add_hline(y=option.K, line_dash="dot", line_color="black", annotation_text="K")
-            Affichage.show_chart(fig, f"cmp_front_{key}")
-            st.caption("Taux sans exercice anticipé : " + (", ".join(f"{r:.0%}" for r, p in frontiers.items() if not p)
-                                                         or "aucun"))
+                    params = PriceParameters(**{**vars(pricer), "nb_steps": n_used})
+                    results = {kind: Orchestrator.exercise_frontier_scenarios(
+                                   market, Option(option.K, option.maturity, kind, "americaine"),
+                                   params,
+                                   {name: (r, d) for name, (r, d, _, _) in scenarios.items()})
+                               for kind, scenarios in cases.items()}
+                st.session_state["res_frontieres"] = (key, results)
+            results = st.session_state["res_frontieres"][1]
+            for col, (kind, scenarios) in zip(st.columns(2), cases.items()):
+                frontiers, div_time = results[kind]
+                fig = Affichage.new_fig(f"Frontière d'exercice du {kind}", "t (années)",
+                                        f"S* (exercer si S {'≤' if kind == 'put' else '≥'} S*)")
+                for name, (r, d, color, dash) in scenarios.items():
+                    points = frontiers[name]
+                    if points:
+                        fig.add_trace(go.Scatter(x=[p[0] for p in points], y=[p[1] for p in points], name=name,
+                                                 mode="lines+markers" if len(points) < 5 else "lines",
+                                                 line=dict(color=color, width=2, dash=dash, shape="hv"),
+                                                 marker=dict(size=9)))
+                fig.add_hline(y=option.K, line_dash="dot", line_color="black")
+                if kind == "call" and div_time is not None:
+                    fig.add_vline(x=div_time, line_dash="dash", line_color="grey")
+                with col:
+                    Affichage.show_chart(fig, f"frontiere_{kind}_{key}")
+                    empty = [name for name, points in frontiers.items() if not points]
+                    if empty:
+                        st.caption("Pas d'exercice anticipé : " + " ; ".join(empty))
 
     @staticmethod
     def grecques_selon_parametre(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
