@@ -570,9 +570,9 @@ class EtudeComparative:
     def frontieres_exercice(market: Market, option: Option, pricer: PriceParameters, key: str) -> None:
         """Frontières d'exercice du put et du call américains pour des scénarios de taux et de dividende fixés."""
         n_used = min(pricer.nb_steps, 500)
-        # date affichée dans les libellés : on retombe sur pricing_date + 6 mois si aucune date n'est fournie
-        div_date_label = market.ex_div_date or (pricer.pricing_date + dt.timedelta(days=182))
-        div = f"D = 3 au {div_date_label:%d/%m/%Y}"
+        # date ex-dividende effective : celle de l'utilisateur, sinon une date de repli (pricing + 6 mois)
+        div_date = market.ex_div_date or (pricer.pricing_date + dt.timedelta(days=182))
+        div = f"D = 3 au {div_date:%d/%m/%Y}"
         # nom : (taux, dividende, couleur, tirets)
         cases = {"put": {"Put, r = 1 %, sans dividende": (0.01, 0.0, "#9ecae1", "solid"),
                          "Put, r = 3 %, sans dividende": (0.03, 0.0, "#4292c6", "solid"),
@@ -581,6 +581,9 @@ class EtudeComparative:
                  "call": {"Call, r = −2 %, sans dividende": (-0.02, 0.0, "#2ca02c", "solid"),
                           f"Call, r = −2 %, {div}": (-0.02, 3.0, "#98df8a", "solid"),
                           f"Call, r = 3 %, {div}": (0.03, 3.0, "#ff7f0e", "solid")}}
+        # marché passé à l'orchestrateur : on garantit une ex_div_date pour que les scénarios "avec dividende" en aient une
+        mkt = market if market.ex_div_date is not None else Market(
+            market.s0, market.rate, market.vol, market.dividend, div_date)
         with Affichage.section(f"Frontières d'exercice – {n_used:,} pas",
                                "Put : exercer si S ≤ S* ; call : exercer si S ≥ S*. Taux et dividendes fixés, "
                                "autres paramètres de marché saisis dans la barre latérale."):
@@ -589,7 +592,7 @@ class EtudeComparative:
                 with st.spinner("Frontières d'exercice…"):
                     params = PriceParameters(**{**vars(pricer), "nb_steps": n_used})
                     results = {kind: Orchestrator.exercise_frontier_scenarios(
-                                   market, Option(option.K, option.maturity, kind, "americaine"),
+                                   mkt, Option(option.K, option.maturity, kind, "americaine"),
                                    params,
                                    {name: (r, d) for name, (r, d, _, _) in scenarios.items()})
                                for kind, scenarios in cases.items()}
@@ -607,7 +610,7 @@ class EtudeComparative:
                                                  line=dict(color=color, width=2, dash=dash, shape="hv"),
                                                  marker=dict(size=9)))
                 fig.add_hline(y=option.K, line_dash="dot", line_color="black")
-                if kind == "call" and div_time is not None:
+                if kind == "call" and div_time:
                     fig.add_vline(x=div_time, line_dash="dash", line_color="grey")
                 with col:
                     Affichage.show_chart(fig, f"frontiere_{kind}_{key}")
