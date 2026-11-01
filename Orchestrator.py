@@ -1,0 +1,445 @@
+from __future__ import annotations
+import gc
+import math
+import time
+import tracemalloc
+import numpy as np
+from scipy.stats import norm
+from Black_Scholes import Black_Scholes, GreeksBS
+from Level import LevelVectorized
+from Market import Market
+from Option import Option
+from OptionPricer import OptionPricerTree
+from PriceParameters import PriceParameters, TreeMethod
+from Sensibilities import GREEKS, GreeksTree
+from Tree import Tree, TreeNode, TreeVectorized
+
+class Orchestrator:
+    """Construit, valorise et libère les arbres ; relie pricing, Black-Scholes et grecques."""
+    @staticmethod
+    def build(market: Market, option: Option, pricer: PriceParameters, pre_steps: int = 0) -> Tree:
+        """Arbre du moteur demandé : TreeNode (objets Node) ou TreeVectorized (tableaux numpy)."""
+        tree_class = TreeNode if pricer.engine == "objects" else TreeVectorized
+        return tree_class(market, option, pricer, pre_steps)
+
+    @staticmethod
+    def price(market: Market, option: Option, pricer: PriceParameters, pre_steps: int = 0) -> float:
+        """Prix de l'arbre (backward, ou récursif si demandé en moteur objets) ; l'arbre est libéré aussitôt."""
+        tree = Orchestrator.build(market, option, pricer, pre_steps)
+        try:
+            return OptionPricerTree(tree).price(pricer.pricing_method if pricer.engine == "objects" else "backward")
+        finally:
+            tree.release()
+
+    @staticmethod
+    def pricing_report(market: Market, option: Option, pricer: PriceParameters) -> dict:
+        """Pricing principal (bouton « Lancer le pricer ») : prix, temps, nombre de nœuds, et l'arbre vectorisé
+        valorisé gardé pour les analyses (en moteur objets, l'arbre de Node est libéré et l'arbre vectorisé,
+        identique, est construit pour l'affichage)."""
+        t0 = time.perf_counter()
+        tree = Orchestrator.build(market, option, pricer)
+        t1 = time.perf_counter()
+        pricer_tree = OptionPricerTree(tree)
+        price = pricer_tree.price(pricer.pricing_method if pricer.engine == "objects" else "backward")
+        t2 = time.perf_counter()
+        if isinstance(tree, TreeNode):
+            tree.release()
+            tree = Orchestrator.vector_tree(market, option, pricer)
+        return {"price": price, "nodes": pricer_tree.nodes_priced, "build_s": t1 - t0, "price_s": t2 - t1,
+                "tree": tree, "bs": Orchestrator.black_scholes(market, option, pricer)}
+
+    @staticmethod
+    def vector_tree(market: Market, option: Option, pricer: PriceParameters, pre_steps: int = 0) -> TreeVectorized:
+        """Arbre vectorisé valorisé, gardé pour les analyses (distribution, dessin de l'arbre, Delta / Gamma).
+
+        C'est le même arbre qu'en moteur objets ; seule la représentation change. L'appelant le libère.
+        """
+        tree = TreeVectorized(market, option, PriceParameters(**{**vars(pricer), "engine": "vector"}), pre_steps)
+        OptionPricerTree(tree).backward_pricing()
+        return tree
+
+    @staticmethod
+    def price_many(market: Market, option: Option, pricer: PriceParameters, strikes, is_call,
+                   is_american) -> np.ndarray:
+        """Plusieurs calls / puts valorisés sur une seule grille vectorisée (une colonne par option)."""
+        tree = TreeVectorized(market, option, PriceParameters(**{**vars(pricer), "engine": "vector"}))
+        try:
+            return OptionPricerTree(tree).price_options_vectorized(strikes, is_call, is_american)
+        finally:
+            tree.release()
+
+    @staticmethod
+    def black_scholes(market: Market, option: Option, pricer: PriceParameters) -> float | None:
+        """Prix Black-Scholes, ou None si la formule ne s'applique pas (américaine ou dividende)."""
+        if not Black_Scholes.is_available(market, option):
+            return None
+        return Black_Scholes(pricer, market, option).pricing_BS()
+
+    @staticmethod
+    def greeks_tree(market: Market, option: Option, pricer: PriceParameters, greeks=GREEKS,
+                    spot_shift: float = 0.01, vol_shift: float = 0.01, rate_shift: float = 0.01,
+                    theta_days: int = 1) -> dict:
+        """Grecques de l'arbre par différences finies : GreeksTree rappelle Orchestrator.price sur des paramètres
+        choqués (arbres vectorisés, plus rapides, même résultat)."""
+        vector_pricer = PriceParameters(**{**vars(pricer), "engine": "vector"})
+        gt = GreeksTree(vector_pricer, market, option, Orchestrator.price, spot_shift, vol_shift, rate_shift,
+                        theta_days)
+        return {g: float(getattr(gt, g.lower())()) for g in greeks}
+
+    @staticmethod
+    def greeks_bs(market: Market, option: Option, pricer: PriceParameters, greeks=GREEKS) -> dict | None:
+        """Grecques Black-Scholes, ou None si la formule ne s'applique pas."""
+        if not Black_Scholes.is_available(market, option):
+            return None
+        return GreeksBS(pricer, market, option).compute(greeks)
+
+    DELTA_METHODS = ("Choc du spot", "Nœuds de l'arbre", "Nœuds autour de la racine")
+
+    @staticmethod
+    def delta_gamma(market: Market, option: Option, pricer: PriceParameters, method: str) -> tuple[float, float]:
+        """Delta et Gamma par les trois méthodes du cours.
+
+        * Choc du spot : GreeksTree (arbre revalorisé à S0 ± 1 %).
+        * Nœuds de l'arbre : 3 nœuds du premier niveau qui en compte 3, sur un seul arbre.
+        * Nœuds autour de la racine : arbre démarré 1 pas (trinomial) ou 2 pas (binomial) avant la date de pricing,
+          qui a donc 3 nœuds à la date de pricing, S0 au milieu.
+        Delta et Gamma sont lus sur 3 nœuds voisins (pas inégaux), Delta ramené en S0 par Taylor.
+        """
+        if method == "Choc du spot":
+            g = Orchestrator.greeks_tree(market, option, pricer, ("Delta", "Gamma"))
+            return g["Delta"], g["Gamma"]
+        pre = (1 if pricer.tree_method.nb_nodes == 3 else 2) if method == "Nœuds autour de la racine" else 0
+        tree = Orchestrator.vector_tree(market, option, pricer, pre)
+        levels = tree.levels
+        tree.release()
+        level = levels[pre] if pre else next(lv for lv in levels if len(lv["S"]) >= 3)
+        order = np.argsort(level["S"])
+        S, V = level["S"][order], level["V"][order]
+        j = int(np.clip(np.argmin(np.abs(S - market.s0)), 1, len(S) - 2))
+        (s0, s1, s2), (v0, v1, v2) = S[j - 1:j + 2], V[j - 1:j + 2]
+        gamma = 2.0 * ((v2 - v1) / (s2 - s1) - (v1 - v0) / (s1 - s0)) / (s2 - s0)
+        return float((v2 - v0) / (s2 - s0) + gamma * (market.s0 - s1)), float(gamma)
+
+    # ------------------------------------------------------------------------------------------------------------
+    # Débogage et contrôles de cohérence (sanity checks)
+    # ------------------------------------------------------------------------------------------------------------
+    @staticmethod
+    def debug_report(market: Market, option: Option, pricer: PriceParameters, tree: TreeVectorized,
+                     build_s: float, price_s: float) -> list[dict]:
+        """Rapport de débogage de l'arbre construit : paramètres de grille, taille, recombinaison, probabilités.
+
+        Chaque ligne : Métrique, Valeur, Critère, Verdict (« Validé », « Attention », « Échec » ou « — » si la
+        ligne est une information). Les transitions sont relues niveau par niveau (même calcul que la construction).
+        """
+        n, levels, steps = tree.n_steps, tree.levels, tree._steps
+        tri_steps = sum(1 for c in steps[1:] if c["tri"])
+        widths = [len(lv["S"]) for lv in levels]
+        branches = merges = singles = clipped = 0
+        clipped_mass, worst_proba, rel_var = 0.0, 0.0, 0.0
+        var_factor = math.exp(2.0 * market.rate * tree.dt_) * math.expm1(market.vol ** 2 * tree.dt_)
+        for i in range(1, n + 1):
+            tr = tree.transitions(i)
+            iu, im, idn = LevelVectorized.child_index(levels[i]["pos"], tr["k"], tr["has"])
+            pu, pm, pd_ = tr["p"]
+            count = tr["has"][0].astype(int) + tr["has"][1].astype(int) + tr["has"][2].astype(int)
+            branches += int(count.sum())
+            merges += int(count.sum()) - widths[i]
+            singles += int((count == 1).sum())
+            worst_proba = max(worst_proba, float(np.max(np.abs(pu + pm + pd_ - 1.0))),
+                              float(-min(pu.min(), pm.min(), pd_.min(), 0.0)), float(max(pu.max(), pm.max(), pd_.max()) - 1.0))
+            S_child, S_par = levels[i]["S"], levels[i - 1]["S"]
+            m1 = S_child[iu] * pu + S_child[im] * pm + S_child[idn] * pd_
+            m2 = S_child[iu] ** 2 * pu + S_child[im] ** 2 * pm + S_child[idn] ** 2 * pd_
+            target_var = S_par ** 2 * var_factor
+            wrong = (count >= 2) & ((np.abs(m1 - tr["E"]) > 1e-9 * tr["E"])
+                                    | (np.abs(m2 - m1 ** 2 - target_var) > 1e-6 * np.maximum(target_var, 1e-300)))
+            clipped += int(wrong.sum())
+            clipped_mass += float(levels[i - 1]["P"][wrong].sum())
+            rel_var = max(rel_var, float((levels[i - 1]["P"] * np.abs(m2 - m1 ** 2 - target_var)
+                                          / np.maximum(target_var, 1e-300))[count >= 2].sum()))
+        ratios = [widths[i] / widths[i - 1] for i in range(3, n + 1) if i != tree.div_step]
+        growth = max(ratios) if ratios else 1.0
+        sum_p = float(levels[-1]["P"].sum())
+        full = (n + 1) ** 2 if tree.nb_nodes == 3 else (n + 1) * (n + 2) // 2
+        if tree.nb_nodes == 3:
+            mode = "Trinomial"
+        else:
+            mode = "Binomial (pas du dividende trinomial)" if tree.div_step else "Binomial"
+        if tree.div_step:
+            exact = PriceParameters.year_fraction(pricer.pricing_date, market.ex_div_date)
+            div_text = (f"D = {market.dividend:,.4f} détaché à la fin du pas {tree.div_step} "
+                        f"(t = {tree.div_step * tree.dt_:.5f} an sur la grille, {exact:.5f} an réel)")
+        else:
+            div_text = "Aucun dividende dans ]date de pricing, maturité]"
+        rows = [
+            {"Métrique": "Méthode", "Valeur": mode, "Critère": "", "Verdict": "—"},
+            {"Métrique": "Nombre de pas N, pas de temps Δt", "Valeur": f"{n:,} pas, Δt = {tree.dt_:.6f} an",
+             "Critère": "", "Verdict": "—"},
+            {"Métrique": "Facteurs de grille", "Critère": "",
+             "Valeur": f"u = √α_bin = {tree.sqrt_alpha_bin:.8f} · α_bin = u² = {tree.alpha_bin:.8f} · "
+                       f"α_tri = {tree.alpha_tri:.8f}", "Verdict": "—"},
+            {"Métrique": "Dividende", "Valeur": div_text, "Critère": "", "Verdict": "—"},
+            {"Métrique": "Pruning", "Critère": "", "Verdict": "—",
+             "Valeur": f"activé (p_min = {pricer.p_min:.0e}), {singles:,} nœuds à un seul enfant" if pricer.pruning
+             else f"désactivé, {singles:,} nœuds à un seul enfant (σ = 0)"},
+            {"Métrique": "Nœuds créés", "Critère": "", "Verdict": "—",
+             "Valeur": f"{sum(widths):,} ({sum(widths) / full:.1%} d'un arbre complet sans dividende)"},
+            {"Métrique": "Largeur maximale / finale", "Valeur": f"{max(widths):,} / {widths[-1]:,} nœuds",
+             "Critère": "", "Verdict": "—"},
+            {"Métrique": "Pas trinomiaux", "Valeur": f"{tri_steps:,} / {n:,}", "Critère": "", "Verdict": "—"},
+            {"Métrique": "Recombinaisons (branches fusionnées)", "Valeur": f"{merges:,} sur {branches:,} branches",
+             "Critère": "> 0 dès N ≥ 2", "Verdict": "Validé" if merges > 0 or n < 2 else "Échec"},
+            {"Métrique": "Croissance maximale d'un niveau (pas ≥ 3, hors dividende)", "Valeur": f"× {growth:.4f}",
+             "Critère": "< × 1,5 (sans recombinaison : × 2 ou × 3)", "Verdict": "Validé" if growth < 1.5 else "Échec"},
+            {"Métrique": "Probabilités de transition dans [0, 1], de somme 1", "Valeur": f"écart max {worst_proba:.1e}",
+             "Critère": "< 1e-12", "Verdict": "Validé" if worst_proba < 1e-12 else "Échec"},
+            {"Métrique": "Nœuds aux moments corrigés (probabilité négative ramenée à 0)",
+             "Valeur": f"{clipped:,} nœuds, masse {clipped_mass:.2e}, erreur relative de variance {rel_var:.1e}",
+             "Critère": "masse < 1e-4",
+             "Verdict": "Validé" if clipped_mass < 1e-4 else "Attention"},
+            {"Métrique": "Somme des probabilités à maturité", "Valeur": f"{sum_p:.12f}", "Critère": "|Σ − 1| < 1e-10",
+             "Verdict": "Validé" if abs(sum_p - 1.0) < 1e-10 else "Échec"},
+            {"Métrique": "Temps", "Critère": "", "Verdict": "—",
+             "Valeur": f"construction {build_s * 1000:,.1f} ms · valorisation {price_s * 1000:,.1f} ms · "
+                       f"total {(build_s + price_s) * 1000:,.1f} ms"},
+        ]
+        return rows
+
+    @staticmethod
+    def sanity_checks(market: Market, option: Option, pricer: PriceParameters, tree: TreeVectorized) -> list[dict]:
+        """Contrôles de cohérence du prix : Black-Scholes, parité call-put, forward, martingale, bornes d'arbitrage,
+        américaine / européenne, égalité des moteurs.
+
+        Chaque ligne : Contrôle, Valeur, Tolérance, Verdict (« Validé », « Échec », « Attention » ou « N/A »), Détail.
+        Les prix complémentaires (call / put, européenne / américaine) sont calculés sur la même grille de pas.
+        """
+        n, levels, r, T = tree.n_steps, tree.levels, market.rate, tree.dt_ * tree.n_steps
+        disc_T = math.exp(-r * T)
+        t_div = tree.div_step * tree.dt_ if tree.div_step else None
+        pv_div = market.dividend * math.exp(-r * t_div) if t_div is not None else 0.0
+        s_adj = market.s0 - pv_div
+        vector = PriceParameters(**{**vars(pricer), "engine": "vector"})
+        prices = {(option.call_put, option.eur_am.value): float(levels[0]["V"][0])}
+        for kind, ex in (("call", "europeen"), ("put", "europeen"), (option.call_put, "americaine"),
+                         (option.call_put, "europeen")):
+            if (kind, ex) not in prices:
+                prices[(kind, ex)] = Orchestrator.price(market, Option(option.K, option.maturity, kind, ex), vector)
+        price, euro, amer = prices[(option.call_put, option.eur_am.value)], prices[(option.call_put, "europeen")], \
+            prices[(option.call_put, "americaine")]
+        tol_inv = max(1e-8, 10.0 * pricer.p_min if pricer.pruning else 0.0) * max(market.s0, option.K)
+        checks = []
+
+        # 1. Européenne sans dividende ≈ Black-Scholes, borne C / (6N) de l'erreur de discrétisation
+        if not option.is_american() and not tree.div_step and market.vol > 0.0 and T > 0.0:
+            bs = Black_Scholes.price_from(market.s0, option.K, T, r, market.vol, option.call_put)
+            d2 = (math.log(market.s0 / option.K) + (r - 0.5 * market.vol ** 2) * T) / (market.vol * math.sqrt(T))
+            C = (1.5 if tree.nb_nodes == 3 else 2.0) * disc_T * option.K * market.vol * math.sqrt(T) * norm.pdf(d2)
+            tol = 1.25 * C / (6 * n) + tol_inv
+            ok = abs(price - bs) <= tol
+            checks.append({"Contrôle": "Européenne sans dividende ≈ Black-Scholes",
+                           "Valeur": f"arbre {price:.6f} · BS {bs:.6f} · écart {price - bs:+.2e}", "Tolérance": f"{tol:.2e}",
+                           "Verdict": "N/A" if n < 30 else ("Validé" if ok else "Échec"),
+                           "Détail": "N < 30 : borne asymptotique non applicable" if n < 30
+                           else "borne C/(6N) de l'erreur de discrétisation, marge 25 %"})
+        else:
+            checks.append({"Contrôle": "Européenne sans dividende ≈ Black-Scholes", "Valeur": "—", "Tolérance": "—",
+                           "Verdict": "N/A", "Détail": "seulement pour une européenne sans dividende"})
+
+        # 2. Parité call-put européenne (avec la date de dividende de la grille)
+        lhs, rhs = prices[("call", "europeen")] - prices[("put", "europeen")], s_adj - option.K * disc_T
+        checks.append({"Contrôle": "Parité call-put : C − P = S0 − D·e^(−r·t_D) − K·e^(−rT)",
+                       "Valeur": f"C − P = {lhs:.8f} · membre de droite = {rhs:.8f} · écart {lhs - rhs:+.2e}",
+                       "Tolérance": f"{tol_inv:.2e}", "Verdict": "Validé" if abs(lhs - rhs) <= tol_inv else
+                       ("Attention" if abs(lhs - rhs) <= 1e-3 * max(market.s0, option.K) else "Échec"),
+                       "Détail": ("date de détachement arrondie au pas de la grille ; " if t_div is not None else "")
+                       + "orange : écart faible dû aux nœuds aux moments corrigés (gros dividende) ou à l'élagage"})
+
+        # 3. Espérance terminale de l'arbre = forward
+        mean_T, fwd = float((levels[-1]["P"] * levels[-1]["S"]).sum()), tree._steps[-1]["F"]
+        checks.append({"Contrôle": "Espérance du sous-jacent à maturité = forward",
+                       "Valeur": f"arbre {mean_T:.8f} · forward {fwd:.8f} · écart {mean_T - fwd:+.2e}",
+                       "Tolérance": f"{tol_inv:.2e}", "Verdict": "Validé" if abs(mean_T - fwd) <= tol_inv else
+                       ("Attention" if abs(mean_T - fwd) <= 1e-3 * max(market.s0, option.K) else "Échec"),
+                       "Détail": "un écart vient des nœuds aux moments corrigés (voir le rapport de débogage)"})
+
+        # 4. Valeur moyenne actualisée par date : martingale (européenne) ou surmartingale (américaine)
+        avg = [float((lv["P"] * lv["V"]).sum()) * math.exp(-r * i * tree.dt_) for i, lv in enumerate(levels)]
+        tol_mart = 1e-9 * max(abs(price), 1.0)
+        if option.is_american():
+            gap = max(avg[i + 1] - avg[i] for i in range(n)) if n else 0.0
+            checks.append({"Contrôle": "Valeur moyenne actualisée décroissante par date (surmartingale)",
+                           "Valeur": f"à t0 {avg[0]:.6f} · à maturité {avg[-1]:.6f} · hausse max {gap:+.2e}",
+                           "Tolérance": f"{tol_mart:.2e}", "Verdict": "Validé" if gap <= tol_mart else "Échec",
+                           "Détail": "V ≥ valeur de continuation à chaque nœud"})
+        else:
+            gap = max(abs(a - avg[0]) for a in avg)
+            checks.append({"Contrôle": "Valeur moyenne actualisée constante par date (martingale)",
+                           "Valeur": f"à t0 {avg[0]:.6f} · à maturité {avg[-1]:.6f} · écart max {gap:.2e}",
+                           "Tolérance": f"{tol_mart:.2e}", "Verdict": "Validé" if gap <= tol_mart else "Échec",
+                           "Détail": "prix actualisé martingale sous la probabilité risque-neutre"})
+
+        # 5. Bornes d'arbitrage
+        if option.call_put == "call":
+            low, high = max(s_adj - option.K * disc_T, 0.0), (market.s0 if option.is_american() else s_adj)
+        else:
+            low, high = max(option.K * disc_T - s_adj, 0.0), (option.K if option.is_american() else option.K * disc_T)
+        if option.is_american():
+            low = max(low, option.payoff(market.s0))
+        checks.append({"Contrôle": "Bornes d'arbitrage", "Valeur": f"{low:.6f} ≤ {price:.6f} ≤ {high:.6f}",
+                       "Tolérance": f"{tol_inv:.2e}",
+                       "Verdict": "Validé" if low - tol_inv <= price <= high + tol_inv else "Échec",
+                       "Détail": "borne basse : valeur intrinsèque actualisée (et immédiate si américaine)"})
+
+        # 6. Américaine ≥ européenne
+        checks.append({"Contrôle": f"{option.call_put.capitalize()} américain ≥ européen",
+                       "Valeur": f"Am {amer:.6f} · Eu {euro:.6f} · prime {amer - euro:+.2e}", "Tolérance": f"{tol_mart:.2e}",
+                       "Verdict": "Validé" if amer - euro >= -tol_mart else "Échec",
+                       "Détail": "le droit d'exercer plus tôt ne peut pas avoir une valeur négative"})
+
+        # 7. Américaine = européenne quand l'exercice anticipé est sous-optimal (sans dividende)
+        if not tree.div_step and ((option.call_put == "call" and r >= 0.0) or (option.call_put == "put" and r <= 0.0)):
+            checks.append({"Contrôle": f"{option.call_put.capitalize()} américain = européen "
+                                       f"(sans dividende, r {'≥' if option.call_put == 'call' else '≤'} 0)",
+                           "Valeur": f"Am {amer:.6f} · Eu {euro:.6f} · écart {amer - euro:+.2e}",
+                           "Tolérance": f"{tol_mart:.2e}",
+                           "Verdict": "Validé" if abs(amer - euro) <= tol_mart else ("Attention" if pricer.pruning and
+                                      abs(amer - euro) <= 1e-4 * max(abs(euro), 1.0) else "Échec"),
+                           "Détail": "borne d'arbitrage : la continuation vaut toujours plus que l'exercice"
+                           if abs(amer - euro) <= tol_mart else "écart dû à l'élagage : un nœud élagué n'a qu'un enfant "
+                           "(vers le centre en binomial), la martingale n'y est plus exacte"})
+        else:
+            checks.append({"Contrôle": "Américaine = européenne (exercice anticipé sous-optimal)", "Valeur": "—",
+                           "Tolérance": "—", "Verdict": "N/A",
+                           "Détail": "seulement sans dividende : call si r ≥ 0, put si r ≤ 0"})
+
+        # 8. Moteurs vectorisé et objets identiques (sur au plus 200 pas)
+        n_test = min(n, 200)
+        test = {**vars(pricer), "nb_steps": n_test}
+        v_vec = Orchestrator.price(market, option, PriceParameters(**{**test, "engine": "vector"}))
+        v_obj = Orchestrator.price(market, option, PriceParameters(**{**test, "engine": "objects", "pricing_method": "backward"}))
+        tol = 1e-9 * max(abs(v_vec), 1.0)
+        checks.append({"Contrôle": "Moteurs vectorisé et objets identiques",
+                       "Valeur": f"N = {n_test} : vectorisé {v_vec:.10f} · objets {v_obj:.10f} · écart {v_vec - v_obj:+.1e}",
+                       "Tolérance": f"{tol:.1e}", "Verdict": "Validé" if abs(v_vec - v_obj) <= tol else "Échec",
+                       "Détail": "deux implémentations indépendantes de la construction et du backward"})
+        return checks
+
+    # ------------------------------------------------------------------------------------------------------------
+    # Analyses ajoutées pour le rapport : exercice anticipé, loi de l'arbre, dividende, position du strike
+    # ------------------------------------------------------------------------------------------------------------
+    @staticmethod
+    def exercise_profile(market: Market, option: Option, pricer: PriceParameters) -> dict:
+        """Option américaine : probabilité d'exercer pour la première fois à chaque date (passe avant absorbante :
+        la probabilité n'est propagée qu'à travers les nœuds non exercés), valeur moyenne actualisée par date
+        e^(-rt) Σ P·V de l'américaine et de l'européenne, et frontière d'exercice (prix critique S* par date)."""
+        out = {}
+        for ex in ("americaine", "europeen"):
+            opt = Option(option.K, option.maturity, option.call_put, ex)
+            tree = Orchestrator.vector_tree(market, opt, PriceParameters(**{**vars(pricer), "engine": "vector"}))
+            levels, n = tree.levels, tree.n_steps
+            times = np.arange(n + 1) * tree.dt_
+            out[ex] = np.array([float((lv["P"] * lv["V"]).sum()) for lv in levels]) * np.exp(-market.rate * times)
+            if ex == "americaine":
+                alive, first = np.array([1.0]), np.zeros(n + 1)
+                for i in range(n + 1):
+                    first[i] = float((alive * levels[i]["ex"]).sum())
+                    if i == n:
+                        break
+                    tr = tree.transitions(i + 1)
+                    iu, im, idn = LevelVectorized.child_index(levels[i + 1]["pos"], tr["k"], tr["has"])
+                    nxt, cont = np.zeros(len(levels[i + 1]["S"])), alive * ~levels[i]["ex"]
+                    for idx, p in zip((iu, im, idn), tr["p"]):
+                        np.add.at(nxt, idx, cont * p)
+                    alive = nxt
+                out["times"], out["first"], out["div_time"] = times, first, tree.div_step * tree.dt_
+                out["frontier"] = [(float(times[i]), float(lv["S"][lv["ex"]].max() if option.call_put == "put"
+                                                           else lv["S"][lv["ex"]].min()))
+                                   for i, lv in enumerate(levels[:-1]) if lv["ex"].any()]
+        return out
+
+    @staticmethod
+    def exercise_frontiers(market: Market, option: Option, pricer: PriceParameters, rates: list[float]) -> dict:
+        """Frontière d'exercice (date, S*) d'une option américaine pour plusieurs taux, dividende du marché conservé."""
+        opt = Option(option.K, option.maturity, option.call_put, "americaine")
+        frontiers = {}
+        for r in rates:
+            m = Market(market.s0, r, market.vol, market.dividend, market.ex_div_date)
+            tree = Orchestrator.vector_tree(m, opt, PriceParameters(**{**vars(pricer), "engine": "vector"}))
+            frontiers[r] = [(i * tree.dt_, float(lv["S"][lv["ex"]].max() if opt.call_put == "put"
+                                                 else lv["S"][lv["ex"]].min()))
+                            for i, lv in enumerate(tree.levels[:-1]) if lv["ex"].any()]
+        return frontiers
+
+    @staticmethod
+    def law_distance(market: Market, option: Option, pricer: PriceParameters) -> float:
+        """Distance de Kolmogorov-Smirnov entre la loi terminale de l'arbre et la log-normale de Black-Scholes
+        (valable sans dividende) : max |F_arbre − F_BS|, évalué de part et d'autre de chaque marche."""
+        tree = Orchestrator.vector_tree(market, option, PriceParameters(**{**vars(pricer), "engine": "vector"}))
+        T, last = tree.dt_ * tree.n_steps, tree.levels[-1]
+        order = np.argsort(last["S"])
+        S, cdf = last["S"][order], np.cumsum(last["P"][order])
+        ref = norm.cdf((np.log(S / market.s0) - (market.rate - 0.5 * market.vol ** 2) * T) / (market.vol * math.sqrt(T)))
+        return float(max(np.max(np.abs(cdf - ref)), np.max(np.abs(np.r_[0.0, cdf[:-1]] - ref))))
+
+    @staticmethod
+    def dividend_moments(market: Market, option: Option, pricer: PriceParameters, dividends: list[float]) -> list[dict]:
+        """Au pas du dividende, pour chaque montant D et chaque arbre : nœuds dont les moments ne sont plus exacts
+        (probabilité négative ramenée à 0), leur masse et l'erreur relative de variance pondérée par la masse."""
+        ex_date = market.ex_div_date
+        if ex_date is None or not pricer.pricing_date < ex_date <= option.maturity:
+            ex_date = pricer.pricing_date + (option.maturity - pricer.pricing_date) / 2
+        rows = []
+        for method in (TreeMethod.TRINOMIAL, TreeMethod.BINOMIAL):
+            for D in dividends:
+                m = Market(market.s0, market.rate, market.vol, D, ex_date)
+                tree = Orchestrator.vector_tree(m, option, PriceParameters(
+                    **{**vars(pricer), "tree_method": method, "engine": "vector", "pruning": False}))
+                i = tree.div_step
+                tr, parents, children = tree.transitions(i), tree.levels[i - 1], tree.levels[i]
+                iu, im, idn = LevelVectorized.child_index(children["pos"], tr["k"], tr["has"])
+                pu, pm, pd_ = tr["p"]
+                S_c = children["S"]
+                m1 = S_c[iu] * pu + S_c[im] * pm + S_c[idn] * pd_
+                m2 = S_c[iu] ** 2 * pu + S_c[im] ** 2 * pm + S_c[idn] ** 2 * pd_
+                target = parents["S"] ** 2 * math.exp(2.0 * m.rate * tree.dt_) * math.expm1(m.vol ** 2 * tree.dt_)
+                rel = np.abs(m2 - m1 ** 2 - target) / np.maximum(target, 1e-300)
+                wrong = (np.abs(m1 - tr["E"]) > 1e-9 * tr["E"]) | (rel > 1e-6)
+                rows.append({"Arbre": method.label, "Dividende D": D, "D / S0": f"{D / m.s0:.0%}",
+                             "Nœuds aux moments corrigés": f"{int(wrong.sum())} sur {len(parents['S'])}",
+                             "Masse de ces nœuds": float(parents["P"][wrong].sum()),
+                             "Erreur relative de variance": float((parents["P"] * rel).sum())})
+        return rows
+
+    @staticmethod
+    def strike_position(tree: TreeVectorized, K: float) -> float:
+        """Position θ ∈ [0, 1[ du strike entre les deux nœuds terminaux qui l'encadrent, mesurée en log."""
+        S = np.sort(tree.levels[-1]["S"])
+        j = int(np.clip(np.searchsorted(S, K, side="right") - 1, 0, len(S) - 2))
+        return float(math.log(K / S[j]) / math.log(S[j + 1] / S[j]))
+
+    @staticmethod
+    def benchmark(market: Market, option: Option, pricer: PriceParameters, method: str = "backward",
+                  memory: bool = False, with_recursive: bool = False) -> dict:
+        """Un pricing mesuré : temps de construction, de valorisation, nombre de nœuds (et pic mémoire Python)."""
+        gc.collect()
+        if memory:
+            tracemalloc.start()
+        t0 = time.perf_counter()
+        tree = Orchestrator.build(market, option, pricer)
+        t1 = time.perf_counter()
+        pricer_tree = OptionPricerTree(tree)
+        price = pricer_tree.price(method)
+        t2 = time.perf_counter()
+        out = {"N": pricer.nb_steps, "Construction (s)": t1 - t0, "Valorisation (s)": t2 - t1,
+               "Total (s)": t2 - t0, "Nœuds": pricer_tree.nodes_priced, "Prix": price}
+        if memory:
+            out["Pic mémoire (Mo)"] = tracemalloc.get_traced_memory()[1] / 2 ** 20
+            tracemalloc.stop()
+        if with_recursive and isinstance(tree, TreeNode):        # même arbre, revalorisé en récursif
+            tree.reset_values()
+            t3 = time.perf_counter()
+            pricer_tree.recursive_pricing()
+            out["Récursif (s)"] = time.perf_counter() - t3
+        tree.release()
+        gc.collect()
+        return out
