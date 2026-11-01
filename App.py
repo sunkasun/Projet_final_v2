@@ -120,5 +120,9 @@ class PricingApp:
             EtudePerformances.render(market, option, pricer, key)
 
 
-if __name__ == "__main__":
+def main() -> None:
     PricingApp().run()
+
+
+if __name__ == "__main__":
+    main()
