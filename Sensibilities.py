@@ -32,7 +32,7 @@ class OneDimDerivative:
 
     def first_derivative(self, name: str, h: float, is_gamma: bool = False):
         """(V(x + h) − V(x − h)) / 2h ; avec is_gamma, les deux pentes décentrées (pour la dérivée seconde)."""
-        up, down = copy.deepcopy(self.parameters), copy.deepcopy(self.parameters)
+        up, down = copy.copy(self.parameters), copy.copy(self.parameters)
         setattr(up, name, getattr(up, name) + h)
         setattr(down, name, getattr(down, name) - h)
         v_up, v_down = self.pricing_function(up), self.pricing_function(down)
@@ -95,7 +95,7 @@ class GreeksTree:
 
     def theta(self) -> float:
         """Maturité raccourcie de theta_days jours calendaires, ramenée à un jour de bourse (× 365/252)."""
-        shocked = copy.deepcopy(self.params)
-        shocked.maturity -= dt.timedelta(days=self.theta_days)
+        shocked = copy.copy(self.params)
+        shocked.maturity = self.params.maturity - dt.timedelta(days=self.theta_days)
         v_now, v_later = self.price_tree_one_dim(self.params), self.price_tree_one_dim(shocked)
         return (v_later - v_now) / self.theta_days * (365.0 / TRADING_DAYS)
