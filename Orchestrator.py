@@ -338,28 +338,42 @@ class Orchestrator:
                         np.add.at(nxt, idx, cont * p)
                     alive = nxt
                 out["times"], out["first"], out["div_time"] = times, first, tree.div_step * tree.dt_
-                out["frontier"] = [(float(times[i]), float(lv["S"][lv["ex"]].max() if option.call_put == "put"
-                                                           else lv["S"][lv["ex"]].min()))
-                                   for i, lv in enumerate(levels[:-1]) if lv["ex"].any()]
+                p_min = pricer.p_min if pricer.pruning else 0.0
+                frontier = []
+                for i, lv in enumerate(levels[:-1]):
+                    mask = lv["ex"] & (lv["P"] >= p_min)
+                    if mask.any():
+                        s_star = lv["S"][mask].max() if option.call_put == "put" else lv["S"][mask].min()
+                        frontier.append((float(times[i]), float(s_star)))
+                out["frontier"] = frontier
             tree.release()
         return out
 
     @staticmethod
-    def exercise_frontier_scenarios(market, option, pricer, scenarios):
+    def exercise_frontier_scenarios(market: Market, option: Option, pricer: PriceParameters,
+                                    scenarios: dict) -> tuple[dict, float | None]:
+        """Frontière d'exercice (date, S*) de l'option américaine pour chaque scénario {nom: (taux, dividende)}.
+        Spot, volatilité, date de détachement, strike et maturité restent ceux de l'utilisateur.
+        Renvoie aussi la date du détachement (en années) pour la tracer sur le graphique."""
         opt = Option(option.K, option.maturity, option.call_put, "americaine")
-        params = PriceParameters(**{**vars(pricer), "engine": "vector"})   # ← ** et non *
+        params = PriceParameters(**{**vars(pricer), "engine": "vector"})
         frontiers, div_time = {}, None
+        p_min = pricer.p_min if pricer.pruning else 0.0
+        
         for name, (r, d) in scenarios.items():
-            tree = Orchestrator.vector_tree(
-                Market(market.s0, r, market.vol, d, market.ex_div_date), opt, params)
+            tree = Orchestrator.vector_tree(Market(market.s0, r, market.vol, d, market.ex_div_date), opt, params)
             try:
                 if d > 0 and tree.div_step > 0:
                     div_time = tree.div_step * tree.dt_
-                frontiers[name] = [
-                    (i * tree.dt_,
-                     float(lv["S"][lv["ex"]].max() if opt.call_put == "put"
-                           else lv["S"][lv["ex"]].min()))
-                    for i, lv in enumerate(tree.levels[:-1]) if lv["ex"].any()]
+                
+                points = []
+                for i, lv in enumerate(tree.levels[:-1]):
+                    # On ne garde que les nœuds qui ont une vraie probabilité (non élagués)
+                    mask = lv["ex"] & (lv["P"] >= p_min)
+                    if mask.any():
+                        s_star = lv["S"][mask].max() if opt.call_put == "put" else lv["S"][mask].min()
+                        points.append((i * tree.dt_, float(s_star)))
+                frontiers[name] = points
             finally:
                 tree.release()
         return frontiers, div_time
