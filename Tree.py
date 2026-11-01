@@ -102,15 +102,19 @@ class TreeNode(Tree):
 
 class TreeVectorized(Tree):
     """Arbre dont chaque niveau est un dictionnaire de tableaux {"S", "P", "pos"} (+ "V", "ex" après valorisation)."""
-
     def __init__(self, market: Market, option: Option, pricer: PriceParameters, pre_steps: int = 0) -> None:
-        super().__init__(market, option, pricer, pre_steps)          # données communes
+        super().__init__(market, option, pricer, pre_steps)    
         self.level_builder = LevelVectorized(self)
         levels = [{"S": np.array([self.spot]), "P": np.array([1.0]), "pos": np.array([0], dtype=np.int64)}]
+        
+        self.transitions_cache = [None] 
+        
         with Tree.gc_paused():
             for i in range(1, self.n_steps + 1):
                 prev = levels[-1]
                 tr = self.level_builder.transitions(i, prev["S"], prev["P"], prev["pos"])
+                self.transitions_cache.append(tr) 
+                
                 k, has, prob = tr["k"], tr["has"], tr["p"]
                 # positions des enfants qui existent, puis probabilités cumulées (somme sur les parents)
                 lo = int(k.min()) - 1
@@ -126,9 +130,8 @@ class TreeVectorized(Tree):
         self.levels: list[dict] | None = levels
 
     def transitions(self, i: int) -> dict:
-        """Transitions du niveau i − 1 vers le niveau i de cet arbre (valorisation, visualisation)."""
-        lv = self.levels[i - 1]
-        return self.level_builder.transitions(i, lv["S"], lv["P"], lv["pos"])
+        """Transitions du niveau i − 1 vers le niveau i (lecture du cache)."""
+        return self.transitions_cache[i]
 
     def reset_values(self) -> None:
         for lv in self.levels:
@@ -137,3 +140,4 @@ class TreeVectorized(Tree):
 
     def release(self) -> None:
         self.levels = None
+        self.transitions_cache = None # On libère aussi le cache
